@@ -1,0 +1,5 @@
+Deployment ID:
+AKfycbyPCQ7vLwbMYIpHoMskANdxd4caDdHZzjOEOXM2hx9ihV9J7YYDU9ius4eF97xI2yLCDQ
+
+Web URL:
+https://script.google.com/macros/s/AKfycbyPCQ7vLwbMYIpHoMskANdxd4caDdHZzjOEOXM2hx9ihV9J7YYDU9ius4eF97xI2yLCDQ/exec

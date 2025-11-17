@@ -1,0 +1,276 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "DHT.h"
+
+// WIFI CONFIGURATION
+const char* ssid = "prototype";
+const char* password = "123321777";
+// GOOGLE SHEETS SCRIPT
+const char* googleScriptURL = "https://script.google.com/macros/s/AKfycbyPCQ7vLwbMYIpHoMskANdxd4caDdHZzjOEOXM2hx9ihV9J7YYDU9ius4eF97xI2yLCDQ/exec"; 
+
+// SENSOR PINS
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define ECG_PIN 34
+#define ECG_LO_PLUS 32
+#define ECG_LO_MINUS 33
+#define I2C_SDA_MAX 25
+#define I2C_SCL_MAX 26
+
+// OBJECTS
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_SSD1306 display(128, 64, &Wire, -1); // OLED on Wire (SDA - 21, SCL - 22)
+MAX30105 particleSensor;                      // MAX30102 on Wire1 (SDA - 25, SCL - 26)
+WebServer server(80);
+
+// VARIABLES
+// Data Storage
+float temp = 0;
+float humid = 0;
+int ecgValue = 0;
+int32_t spo2 = 0;
+int8_t validSPO2 = 0;
+int32_t heartRate = 0;
+int8_t validHeartRate = 0;
+
+// SpO2 Buffer
+#define MAX_SAMPLES 100
+uint32_t irBuffer[MAX_SAMPLES];
+uint32_t redBuffer[MAX_SAMPLES];
+
+// Timers
+unsigned long lastCloudUpload = 0;
+const long cloudInterval = 30000; // Upload every 30 seconds
+
+// HTML Dashboard Code (Stored in Flash Memory)
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="5">
+  <title>ESP32 Health Monitor</title>
+  <style>
+    body { font-family: Arial; text-align: center; margin:0; background-color: #f4f4f4; }
+    .header { background-color: #0c6980; color: white; padding: 10px; }
+    .card { background: white; padding: 20px; margin: 10px; border-radius: 10px; box-shadow: 2px 2px 10px rgba(0,0,0,0.1); display: inline-block; width: 200px; }
+    .val { font-size: 2rem; font-weight: bold; color: #0c6980; }
+    .label { color: #555; }
+  </style>
+</head>
+<body>
+  <div class="header"><h1>Health Dashboard</h1></div>
+  
+  <div class="card">
+    <div class="label">Heart Rate</div>
+    <div class="val">%BPM% <span style="font-size:1rem">bpm</span></div>
+  </div>
+  
+  <div class="card">
+    <div class="label">SpO2</div>
+    <div class="val">%SPO2% <span style="font-size:1rem">%</span></div>
+  </div>
+
+  <div class="card">
+    <div class="label">Temperature</div>
+    <div class="val">%TEMP% <span style="font-size:1rem">C</span></div>
+  </div>
+
+  <div class="card">
+    <div class="label">Humidity</div>
+    <div class="val">%HUMID% <span style="font-size:1rem">%</span></div>
+  </div>
+
+  <div class="card">
+    <div class="label">ECG (Raw)</div>
+    <div class="val">%ECG%</div>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+// FUNCTIONS
+
+// 1. Dashboard Handler
+void handleRoot() {
+  String s = index_html;
+  s.replace("%BPM%", String(heartRate));
+  s.replace("%SPO2%", String(spo2));
+  s.replace("%TEMP%", String(temp));
+  s.replace("%HUMID%", String(humid));
+  s.replace("%ECG%", String(ecgValue));
+  server.send(200, "text/html", s);
+}
+
+// 2. Send to Google Sheets
+void sendToCloud() {
+  if(WiFi.status() == WL_CONNECTED){
+    
+    WiFiClientSecure client;       // Create a secure client
+    client.setInsecure();          // Tell it to ignore SSL certificate errors
+    
+    HTTPClient http;
+    
+    // We pass the 'client' into the http.begin function
+    http.begin(client, googleScriptURL); 
+    
+    http.addHeader("Content-Type", "application/json");
+    
+    // Create JSON: {"bpm":72, "spo2":98, "temp":36.5, "humid":60, "ecg":2000}
+    StaticJsonDocument<200> doc;
+    doc["bpm"] = heartRate;
+    doc["spo2"] = spo2;
+    doc["temp"] = temp;
+    doc["humid"] = humid;
+    doc["ecg"] = ecgValue;
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    
+    int httpResponseCode = http.POST(jsonStr);
+    if (httpResponseCode > 0) {
+      Serial.print("Cloud Logged. Response: "); Serial.println(httpResponseCode);
+    } else {
+      Serial.print("Error Logging: "); Serial.println(httpResponseCode);
+    }
+    http.end();
+  }
+}
+
+// 3. Read DHT & ECG
+void readBasicSensors() {
+  // DHT11
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (!isnan(t)) temp = t;
+  if (!isnan(h)) humid = h;
+
+  // ECG
+  if((digitalRead(ECG_LO_PLUS) == 1) || (digitalRead(ECG_LO_MINUS) == 1)){
+    ecgValue = 0; // Leads off
+  } else {
+    ecgValue = analogRead(ECG_PIN);
+  }
+}
+
+// 4. Update OLED (MAX30102 Data Only)
+void updateOLED() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0,0);
+  display.println("PULSE OXIMETER");
+  
+  display.setTextSize(2);
+  display.setCursor(0, 20);
+  display.print("BPM:");
+  if(validHeartRate) display.print(heartRate);
+  else display.print("--");
+  
+  display.setCursor(0, 45);
+  display.print("SpO2:");
+  if(validSPO2) display.print(spo2);
+  else display.print("--");
+  display.print("%");
+  
+  display.display();
+}
+
+// SETUP
+void setup() {
+  Serial.begin(115200);
+  
+  // 1. Initialize Sensors
+  dht.begin();
+  pinMode(ECG_LO_PLUS, INPUT);
+  pinMode(ECG_LO_MINUS, INPUT);
+  
+  Wire.begin(); // OLED (21, 22)
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;);
+  }
+  display.clearDisplay();
+  display.println("Initializing...");
+  display.display();
+
+  Wire1.begin(I2C_SDA_MAX, I2C_SCL_MAX); // MAX30102 (25, 26)
+  if (!particleSensor.begin(Wire1, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 not found. Check wiring!");
+    while (1);
+  }
+  
+  // Setup MAX30102
+  byte ledBrightness = 60; // Options: 0=Off to 255=50mA
+  byte sampleAverage = 4; 
+  byte ledMode = 2; 
+  int sampleRate = 100; 
+  int pulseWidth = 411; 
+  int adcRange = 4096; 
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+
+  // 2. Initialize Wi-Fi
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+  
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("WiFi Connected!");
+  display.println(WiFi.localIP());
+  display.display();
+  delay(2000);
+
+  // 3. Start Web Server
+  server.on("/", handleRoot);
+  server.begin();
+}
+
+// LOOP
+void loop() {
+  // 1. Handle Web Server Requests
+  server.handleClient();
+
+  // 2. Gather 100 Samples for MAX30102 (Critical Loop)
+  // We must read 100 samples to calculate SpO2. 
+  // To prevent the webserver from freezing, we handleClient INSIDE this loop.
+  for (byte i = 0 ; i < MAX_SAMPLES ; i++) {
+    while (particleSensor.available() == false) {
+      particleSensor.check(); 
+    }
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample();
+    
+    // Keep dashboard responsive while reading sensor
+    server.handleClient(); 
+  }
+
+  // 3. Calculate SpO2 & BPM
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, MAX_SAMPLES, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+
+  // 4. Read Other Sensors
+  readBasicSensors();
+
+  // 5. Update Display (OLED - Only MAX data)
+  updateOLED();
+
+  // 6. Log to Cloud (Every 30 seconds)
+  if (millis() - lastCloudUpload > cloudInterval) {
+    sendToCloud();
+    lastCloudUpload = millis();
+  }
+}

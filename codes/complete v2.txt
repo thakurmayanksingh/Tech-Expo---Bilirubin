@@ -1,0 +1,319 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "DHT.h"
+
+// ================= CONFIGURATION =================
+const char* ssid = "prototype";
+const char* password = "123321777";
+// Your Google Script URL
+const char* googleScriptURL = "https://script.google.com/macros/s/AKfycbyPCQ7vLwbMYIpHoMskANdxd4caDdHZzjOEOXM2hx9ihV9J7YYDU9ius4eF97xI2yLCDQ/exec"; 
+
+// ================= SENSOR PINS =================
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define ECG_PIN 34
+#define ECG_LO_PLUS 32
+#define ECG_LO_MINUS 33
+#define I2C_SDA_MAX 25
+#define I2C_SCL_MAX 26
+
+// ================= OBJECTS =================
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_SSD1306 display(128, 64, &Wire, -1); // OLED on Wire (SDA - 21, SCL - 22)
+MAX30105 particleSensor;                      // MAX30102 on Wire1 (SDA - 25, SCL - 26)
+WebServer server(80);
+
+// ================= VARIABLES =================
+// Data Storage
+float temp = 0;
+float humid = 0;
+int ecgValue = 0;
+int32_t spo2 = 0;
+int8_t validSPO2 = 0;
+int32_t heartRate = 0;
+int8_t validHeartRate = 0;
+bool fingerDetected = false;
+
+// SpO2 Buffer
+#define MAX_SAMPLES 100
+uint32_t irBuffer[MAX_SAMPLES];
+uint32_t redBuffer[MAX_SAMPLES];
+
+// Timers
+unsigned long lastCloudUpload = 0;
+const long cloudInterval = 30000; // Upload every 30 seconds
+
+// HTML Dashboard Code (Stored in Flash Memory)
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="5">
+  <title>ESP32 Health Monitor</title>
+  <style>
+    body { font-family: Arial; text-align: center; margin:0; background-color: #f4f4f4; }
+    .header { background-color: #0c6980; color: white; padding: 10px; }
+    .card { background: white; padding: 20px; margin: 10px; border-radius: 10px; box-shadow: 2px 2px 10px rgba(0,0,0,0.1); display: inline-block; width: 200px; }
+    .val { font-size: 2rem; font-weight: bold; color: #0c6980; }
+    .label { color: #555; }
+    .warning { color: red; font-size: 0.8rem; }
+  </style>
+</head>
+<body>
+  <div class="header"><h1>Health Dashboard</h1></div>
+  
+  <div class="card">
+    <div class="label">Heart Rate</div>
+    <div class="val">%BPM% <span style="font-size:1rem">bpm</span></div>
+  </div>
+  
+  <div class="card">
+    <div class="label">SpO2</div>
+    <div class="val">%SPO2% <span style="font-size:1rem">%</span></div>
+  </div>
+
+  <div class="card">
+    <div class="label">Temperature</div>
+    <div class="val">%TEMP% <span style="font-size:1rem">C</span></div>
+  </div>
+
+  <div class="card">
+    <div class="label">Humidity</div>
+    <div class="val">%HUMID% <span style="font-size:1rem">%</span></div>
+  </div>
+
+  <div class="card">
+    <div class="label">ECG (Raw)</div>
+    <div class="val">%ECG%</div>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+// ================= FUNCTIONS =================
+
+// 1. Dashboard Handler
+void handleRoot() {
+  String s = index_html;
+  
+  if (fingerDetected) {
+    s.replace("%BPM%", String(heartRate));
+    s.replace("%SPO2%", String(spo2));
+  } else {
+    s.replace("%BPM%", "--");
+    s.replace("%SPO2%", "--");
+  }
+  
+  s.replace("%TEMP%", String(temp));
+  s.replace("%HUMID%", String(humid));
+  s.replace("%ECG%", String(ecgValue));
+  server.send(200, "text/html", s);
+}
+
+// 2. Send to Google Sheets
+void sendToCloud() {
+  if(WiFi.status() == WL_CONNECTED){
+    
+    WiFiClientSecure client;       
+    client.setInsecure();          
+    
+    HTTPClient http;
+    http.begin(client, googleScriptURL); 
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Critical for Google 302
+    http.addHeader("Content-Type", "application/json");
+    
+    StaticJsonDocument<200> doc;
+    // Only send valid heart data if finger is detected, otherwise 0
+    if (fingerDetected) {
+        doc["bpm"] = heartRate;
+        doc["spo2"] = spo2;
+    } else {
+        doc["bpm"] = 0;
+        doc["spo2"] = 0;
+    }
+    doc["temp"] = temp;
+    doc["humid"] = humid;
+    doc["ecg"] = ecgValue;
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    
+    int httpResponseCode = http.POST(jsonStr);
+    if (httpResponseCode > 0) {
+      Serial.print("Cloud Logged. Response: "); Serial.println(httpResponseCode);
+    } else {
+      Serial.print("Error Logging: "); Serial.println(httpResponseCode);
+    }
+    http.end();
+  }
+}
+
+// 3. Read Basic Sensors
+void readBasicSensors() {
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (!isnan(t)) temp = t;
+  if (!isnan(h)) humid = h;
+
+  if((digitalRead(ECG_LO_PLUS) == 1) || (digitalRead(ECG_LO_MINUS) == 1)){
+    ecgValue = 0; 
+  } else {
+    ecgValue = analogRead(ECG_PIN);
+  }
+}
+
+// 4. Update OLED (Using YOUR Custom Layout)
+void updateOLED() {
+  display.clearDisplay();
+
+  if (!fingerDetected) {
+    // No Finger Layout
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Pulse Oximeter");
+    display.println("Place finger");
+    display.println("on sensor...");
+    display.display();
+  } else {
+    // Measurement Layout
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("HEART RATE");
+    display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+    
+    display.setTextSize(3);
+    display.setCursor(20, 15);
+    
+    if(validHeartRate) {
+      if(heartRate < 100) display.print(" ");
+      display.print(heartRate);
+    } else {
+      display.setTextSize(2);
+      display.setCursor(0, 20);
+      display.print("SEARCHING");
+    }
+    
+    display.setTextSize(1);
+    display.setCursor(100, 25);
+    display.println("BPM");
+    
+    display.drawLine(0, 38, 128, 38, SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 40);
+    display.println("BLOOD OXYGEN");
+    
+    display.setTextSize(2);
+    display.setCursor(35, 48);
+    
+    if(validSPO2) {
+      display.print(spo2);
+      display.print("%");
+    } else {
+      display.print("-- %");
+    }
+    display.display();
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  
+  dht.begin();
+  pinMode(ECG_LO_PLUS, INPUT);
+  pinMode(ECG_LO_MINUS, INPUT);
+  
+  Wire.begin(); // OLED
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;);
+  }
+  display.clearDisplay();
+  display.println("System Init...");
+  display.display();
+
+  Wire1.begin(I2C_SDA_MAX, I2C_SCL_MAX); // MAX30102
+  if (!particleSensor.begin(Wire1, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 not found. Check wiring!");
+    while (1);
+  }
+  
+  // --- YOUR SPECIFIC TUNING PARAMETERS ---
+  byte ledBrightness = 0x1F; // 31 (Your preferred setting)
+  byte sampleAverage = 4; 
+  byte ledMode = 2; 
+  int sampleRate = 400;      // Your preferred setting
+  int pulseWidth = 411; 
+  int adcRange = 4096; 
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+  
+  particleSensor.setPulseAmplitudeRed(ledBrightness);
+  particleSensor.setPulseAmplitudeIR(ledBrightness);
+
+  // Connect Wi-Fi
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println(WiFi.localIP());
+  
+  display.clearDisplay();
+  display.println("WiFi Connected!");
+  display.display();
+  delay(1000);
+
+  server.on("/", handleRoot);
+  server.begin();
+}
+
+// ================= LOOP =================
+void loop() {
+  // 1. Gather 100 Samples
+  for (byte i = 0 ; i < MAX_SAMPLES ; i++) {
+    while (particleSensor.available() == false) {
+      particleSensor.check();
+      server.handleClient();
+    }
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample();
+    
+    // Keep web dashboard alive during sampling
+    server.handleClient(); 
+  }
+
+  // 2. Finger Detection Logic
+  // Check the last sample. If IR < 50000, assume no finger.
+  if (irBuffer[99] < 50000) {
+    fingerDetected = false;
+  } else {
+    fingerDetected = true;
+    // Only run math if finger is present
+    maxim_heart_rate_and_oxygen_saturation(irBuffer, MAX_SAMPLES, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+  }
+
+  // 3. Read other sensors
+  readBasicSensors();
+
+  // 4. Update OLED with your custom layout
+  updateOLED();
+
+  // 5. Log to Cloud
+  if (millis() - lastCloudUpload > cloudInterval) {
+    sendToCloud();
+    lastCloudUpload = millis();
+  }
+}
